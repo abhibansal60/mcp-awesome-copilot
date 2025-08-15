@@ -1,6 +1,9 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { completable } from "@modelcontextprotocol/sdk/server/completable.js";
+import { z } from "zod";
 import { HandshakeResponse } from "./types/protocol.js";
+import { ExtensionCacheService } from "./extensionCache.js";
 
 // Lightweight shared types adapted from extension
 type ItemType = "instruction" | "prompt" | "chatmode";
@@ -106,6 +109,9 @@ function buildRawUrl(path: string): string {
 let cachedItems: CatalogItem[] | null = null;
 let cachedAt: number | null = null;
 
+// Extension cache service
+const extensionCache = new ExtensionCacheService();
+
 function isCacheValid(): boolean {
   if (!cachedAt) return false;
   const diffHours = (Date.now() - cachedAt) / (1000 * 60 * 60);
@@ -115,6 +121,18 @@ function isCacheValid(): boolean {
 async function buildIndex(forceRefresh = false): Promise<CatalogItem[]> {
   if (!forceRefresh && cachedItems && isCacheValid()) return cachedItems;
 
+  // Try extension cache first
+  if (!forceRefresh) {
+    const extensionCachedItems = await extensionCache.getCachedCatalog(CACHE_TTL_HOURS);
+    if (extensionCachedItems) {
+      console.log('Using extension cache for index');
+      cachedItems = extensionCachedItems;
+      cachedAt = Date.now();
+      return extensionCachedItems;
+    }
+  }
+
+  console.log('Fetching from GitHub API');
   const tree = await fetchFullTree();
   const candidates: Array<{ path: string; type: ItemType }> = [];
   for (const entry of tree) {
@@ -158,7 +176,18 @@ function keywordSearch(items: CatalogItem[], query: string): CatalogItem[] {
 }
 
 async function expandIndexByKeywords(query: string): Promise<CatalogItem[]> {
-  const existing = cachedItems ?? [];
+  let existing = cachedItems ?? [];
+  
+  // Try extension cache if we don't have local cache
+  if (existing.length === 0) {
+    const extensionCachedItems = await extensionCache.getCachedCatalog(CACHE_TTL_HOURS);
+    if (extensionCachedItems) {
+      existing = extensionCachedItems;
+      cachedItems = extensionCachedItems;
+      cachedAt = Date.now();
+    }
+  }
+  
   const tree = await fetchFullTree();
   const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
   const candidates: Array<{ path: string; type: ItemType }> = [];
@@ -197,93 +226,253 @@ async function expandIndexByKeywords(query: string): Promise<CatalogItem[]> {
   return merged;
 }
 
-// MCP server setup
+// MCP server setup using the TypeScript SDK recommended APIs
 const transport = new StdioServerTransport();
 const packageVersion = "0.1.0"; // keep in sync with package.json
 const mcp = new McpServer({ name: "mcp-awesome-copilot-server", version: packageVersion });
 
-// Handshake capability discovery
-const capabilities = ["listItems", "search", "install", "rateLimit", "setRepo"];
+// Optional: Titles improve UI display in clients
 
-mcp.tool("handshake", {
-  description: "Return server and protocol compatibility info",
-}, async (): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
-  const resp: HandshakeResponse = {
-    serverVersion: packageVersion,
-    protocolVersions: ["1.0"],
-    capabilities,
-  };
-  return { content: [{ type: "text", text: JSON.stringify(resp) }] };
-});
+// Handshake capability discovery (kept as a tool for backwards compatibility)
+mcp.registerTool(
+  "handshake",
+  {
+    title: "Handshake",
+    description: "Return server and protocol compatibility info",
+  },
+  async (): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+    const resp: HandshakeResponse = {
+      serverVersion: packageVersion,
+      protocolVersions: ["1.0"],
+      capabilities: ["listItems", "search", "install", "rateLimit", "setRepo"],
+    };
+    return { content: [{ type: "text", text: JSON.stringify(resp) }] };
+  }
+);
 
-mcp.tool("build_index", {
-  description: "Build or refresh the catalog index from the configured GitHub repo.",
-  inputSchema: { forceRefresh: { description: "Ignore cache", type: "boolean" } },
-}, async ({ forceRefresh }) => {
-  const items = await buildIndex(Boolean(forceRefresh));
-  return { content: [{ type: "text", text: JSON.stringify(items) }] };
-});
+mcp.registerTool(
+  "build_index",
+  {
+    title: "Build Index",
+    description: "Build or refresh the catalog index from the configured GitHub repo.",
+    inputSchema: { forceRefresh: z.boolean().optional() },
+  },
+  async ({ forceRefresh }) => {
+    const items = await buildIndex(Boolean(forceRefresh));
+    return { content: [{ type: "text", text: JSON.stringify(items) }] };
+  }
+);
 
-mcp.tool("search", {
-  description: "Search items by keywords; expands index if nothing is found.",
-  inputSchema: { query: { type: "string" } },
-}, async ({ query }) => {
-  const base = await buildIndex(false);
-  let results = keywordSearch(base, String(query || ""));
-  if (results.length === 0) results = keywordSearch(await expandIndexByKeywords(String(query || "")), String(query || ""));
-  return { content: [{ type: "text", text: JSON.stringify(results) }] };
-});
+mcp.registerTool(
+  "search",
+  {
+    title: "Search Items",
+    description: "Search items by keywords; expands index if nothing is found.",
+    inputSchema: { query: z.string() },
+  },
+  async ({ query }) => {
+    const base = await buildIndex(false);
+    let results = keywordSearch(base, String(query || ""));
+    if (results.length === 0) results = keywordSearch(await expandIndexByKeywords(String(query || "")), String(query || ""));
+    return { content: [{ type: "text", text: JSON.stringify(results) }] };
+  }
+);
 
-mcp.tool("preview", {
-  description: "Fetch raw content for a given item path and return as markdown text.",
-  inputSchema: { path: { type: "string" } },
-}, async ({ path }) => {
-  const items = await buildIndex(false);
-  const item = items.find(i => i.path === path);
-  if (!item) throw new Error("Item not found in index; run build_index first");
-  const content = await fetchFileContentRaw(item.rawUrl);
-  return { content: [{ type: "text", text: JSON.stringify({ title: item.title, content, rawUrl: item.rawUrl }) }] };
-});
+mcp.registerTool(
+  "preview",
+  {
+    title: "Preview Item",
+    description: "Fetch raw content for a given item path and return as markdown text.",
+    inputSchema: { path: z.string() },
+  },
+  async ({ path }) => {
+    const items = await buildIndex(false);
+    const item = items.find(i => i.path === path);
+    if (!item) throw new Error("Item not found in index; run build_index first");
+    const content = await fetchFileContentRaw(item.rawUrl);
+    return { content: [{ type: "text", text: JSON.stringify({ title: item.title, content, rawUrl: item.rawUrl }) }] };
+  }
+);
 
-mcp.tool("install", {
-  description: "Return a suggested filename and content for installing into a workspace.",
-  inputSchema: { path: { type: "string" } },
-}, async ({ path }) => {
-  const items = await buildIndex(false);
-  const item = items.find(i => i.path === path);
-  if (!item) throw new Error("Item not found in index; run build_index first");
-  const content = await fetchFileContentRaw(item.rawUrl);
-  const subfolder = item.type === "instruction" ? "copilot-instructions" : item.type === "prompt" ? "copilot-prompts" : "copilot-chatmodes";
-  const relativeDir = `.github/${subfolder}`;
-  const filename = item.path.split("/").pop() || `${item.id}.md`;
-  return { content: [{ type: "text", text: JSON.stringify({ relativeDir, filename, content }) }] };
-});
+mcp.registerTool(
+  "install",
+  {
+    title: "Install Suggested File",
+    description: "Return a suggested filename and content for installing into a workspace.",
+    inputSchema: { path: z.string() },
+  },
+  async ({ path }) => {
+    const items = await buildIndex(false);
+    const item = items.find(i => i.path === path);
+    if (!item) throw new Error("Item not found in index; run build_index first");
+    const content = await fetchFileContentRaw(item.rawUrl);
+    const subfolder = item.type === "instruction" ? "copilot-instructions" : item.type === "prompt" ? "copilot-prompts" : "copilot-chatmodes";
+    const relativeDir = `.github/${subfolder}`;
+    const filename = item.path.split("/").pop() || `${item.id}.md`;
+    return { content: [{ type: "text", text: JSON.stringify({ relativeDir, filename, content }) }] };
+  }
+);
 
-mcp.tool("rate_limit", { description: "Get current GitHub API rate limit info" }, async () => {
-  const res = await fetch("https://api.github.com/rate_limit", { headers: ghHeaders() });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  const core = json?.resources?.core || {};
-  const resetTime = new Date((core.reset ?? Math.ceil(Date.now()/1000)) * 1000);
-  const resetInSeconds = Math.max(0, Math.ceil((resetTime.getTime() - Date.now()) / 1000));
-  return { content: [{ type: "text", text: JSON.stringify({ remaining: core.remaining, limit: core.limit, resetTime: resetTime.toISOString(), resetInSeconds }) }] };
-});
+mcp.registerTool(
+  "rate_limit",
+  {
+    title: "GitHub Rate Limit",
+    description: "Get current GitHub API rate limit info",
+  },
+  async () => {
+    const res = await fetch("https://api.github.com/rate_limit", { headers: ghHeaders() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    const core = json?.resources?.core || {};
+    const resetTime = new Date((core.reset ?? Math.ceil(Date.now()/1000)) * 1000);
+    const resetInSeconds = Math.max(0, Math.ceil((resetTime.getTime() - Date.now()) / 1000));
+    return { content: [{ type: "text", text: JSON.stringify({ remaining: core.remaining, limit: core.limit, resetTime: resetTime.toISOString(), resetInSeconds }) }] };
+  }
+);
 
-mcp.tool("set_repo", {
-  description: "Set the GitHub repo/branch and optional limits; clears cache.",
-  inputSchema: { repo: { type: "string" }, branch: { type: "string" }, maxItems: { type: "number" }, cacheTtlHours: { type: "number" } },
-}, async ({ repo, branch, maxItems, cacheTtlHours }) => {
-  CONTENT_REPO = (repo as string) || CONTENT_REPO;
-  if (branch) CONTENT_BRANCH = String(branch);
-  if (typeof maxItems === "number" && maxItems >= 1) MAX_ITEMS = Math.max(1, Math.floor(maxItems));
-  if (typeof cacheTtlHours === "number" && cacheTtlHours >= 1) CACHE_TTL_HOURS = Math.max(1, Math.floor(cacheTtlHours));
-  cachedItems = null; cachedAt = null;
-  return { content: [{ type: "text", text: JSON.stringify({ repo: CONTENT_REPO, branch: CONTENT_BRANCH, maxItems: MAX_ITEMS, cacheTtlHours: CACHE_TTL_HOURS }) }] };
-});
+mcp.registerTool(
+  "set_repo",
+  {
+    title: "Set Repo/Branch",
+    description: "Set the GitHub repo/branch and optional limits; clears cache.",
+    inputSchema: {
+      repo: z.string().optional(),
+      branch: z.string().optional(),
+      maxItems: z.number().int().min(1).optional(),
+      cacheTtlHours: z.number().int().min(1).optional(),
+    },
+  },
+  async ({ repo, branch, maxItems, cacheTtlHours }) => {
+    CONTENT_REPO = (repo as string) || CONTENT_REPO;
+    if (branch) CONTENT_BRANCH = String(branch);
+    if (typeof maxItems === "number" && maxItems >= 1) MAX_ITEMS = Math.max(1, Math.floor(maxItems));
+    if (typeof cacheTtlHours === "number" && cacheTtlHours >= 1) CACHE_TTL_HOURS = Math.max(1, Math.floor(cacheTtlHours));
+    cachedItems = null; cachedAt = null;
+    return { content: [{ type: "text", text: JSON.stringify({ repo: CONTENT_REPO, branch: CONTENT_BRANCH, maxItems: MAX_ITEMS, cacheTtlHours: CACHE_TTL_HOURS }) }] };
+  }
+);
 
-mcp.tool("get_config", { description: "Return current server configuration" }, async () => {
-  return { content: [{ type: "text", text: JSON.stringify({ repo: CONTENT_REPO, branch: CONTENT_BRANCH, maxItems: MAX_ITEMS, cacheTtlHours: CACHE_TTL_HOURS, tokenConfigured: Boolean(GITHUB_TOKEN) }) }] };
-});
+mcp.registerTool(
+  "get_config",
+  {
+    title: "Get Server Config",
+    description: "Return current server configuration",
+  },
+  async () => {
+    const extensionCacheInfo = await extensionCache.getCacheInfo();
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify({ 
+          repo: CONTENT_REPO, 
+          branch: CONTENT_BRANCH, 
+          maxItems: MAX_ITEMS, 
+          cacheTtlHours: CACHE_TTL_HOURS, 
+          tokenConfigured: Boolean(GITHUB_TOKEN),
+          extensionCache: extensionCacheInfo
+        }) 
+      }] 
+    };
+  }
+);
+
+// Resources
+mcp.registerResource(
+  "catalog-list",
+  "catalog://items",
+  {
+    title: "Catalog Items",
+    description: "List of catalog items from the configured GitHub repo",
+    mimeType: "application/json",
+  },
+  async (uri) => {
+    const items = await buildIndex(false);
+    return {
+      contents: [
+        {
+          uri: uri.href,
+          text: JSON.stringify(items),
+        },
+      ],
+    };
+  }
+);
+
+mcp.registerResource(
+  "catalog-item",
+  new ResourceTemplate("catalog://item/{path}", {
+    list: undefined,
+    complete: {
+      path: async (value: string) => {
+        const items = await buildIndex(false);
+        const v = (value ?? "").toLowerCase();
+        return items
+          .map(i => i.path)
+          .filter(p => p.toLowerCase().startsWith(v))
+          .slice(0, 50);
+      },
+    },
+  }),
+  {
+    title: "Catalog Item",
+    description: "Fetch the content of a specific catalog item by its path",
+    mimeType: "application/json",
+  },
+  async (uri, { path }) => {
+    const items = await buildIndex(false);
+    const decodedPath = decodeURIComponent(String(path));
+    const item = items.find((i) => i.path === decodedPath);
+    if (!item) {
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            text: JSON.stringify({ error: "Item not found. Run build_index and verify path." }),
+          },
+        ],
+      };
+    }
+    const content = await fetchFileContentRaw(item.rawUrl);
+    return {
+      contents: [
+        {
+          uri: uri.href,
+          text: JSON.stringify({ title: item.title, path: item.path, rawUrl: item.rawUrl, content }),
+        },
+      ],
+    };
+  }
+);
+
+// Prompt
+mcp.registerPrompt(
+  "preview-item",
+  {
+    title: "Preview Catalog Item",
+    description: "Prepare a message with the content of a catalog item given its path",
+    argsSchema: {
+      path: completable(z.string(), async (value: string) => {
+        const items = await buildIndex(false);
+        const v = (value ?? "").toLowerCase();
+        return items
+          .map(i => i.path)
+          .filter(p => p.toLowerCase().startsWith(v))
+          .slice(0, 50);
+      }),
+    },
+  },
+  ({ path }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `Please preview and summarize the item at path: ${path}. If it's markdown, summarize key sections and suggest how to use it.`,
+        },
+      },
+    ],
+  })
+);
 
 async function runServer(): Promise<void> {
   await mcp.connect(transport);
@@ -295,7 +484,7 @@ async function maybePrintHandshakeAndExit(): Promise<boolean> {
     const resp: HandshakeResponse = {
       serverVersion: packageVersion,
       protocolVersions: ["1.0"],
-      capabilities,
+      capabilities: ["listItems", "search", "install", "rateLimit", "setRepo"],
     };
     console.log(JSON.stringify(resp));
     return true;
@@ -314,4 +503,3 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
-
