@@ -1,11 +1,15 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { completable } from "@modelcontextprotocol/sdk/server/completable.js";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { HandshakeResponse } from "./types/protocol.js";
 import { ExtensionCacheService } from "./extensionCache.js";
+import { SearchRouter, MCPServerInterface, WebSearchInterface } from "./searchRouter.js";
+import { IntentRouter } from "./intentRouter.js";
+import { telemetryService } from "./telemetry.js";
 
-// Lightweight shared types adapted from extension
+// Type definitions
 type ItemType = "instruction" | "prompt" | "chatmode";
 interface CatalogItem {
   id: string;
@@ -18,24 +22,37 @@ interface CatalogItem {
   sha: string;
 }
 
-// Config via env for pluggability
-let CONTENT_REPO = process.env.AWESOME_COPILOT_REPO || "github/awesome-copilot";
-let CONTENT_BRANCH = process.env.AWESOME_COPILOT_BRANCH || "main";
-let MAX_ITEMS = Math.max(1, Number(process.env.AWESOME_COPILOT_MAX_ITEMS || 15));
-let CACHE_TTL_HOURS = Math.max(1, Number(process.env.AWESOME_COPILOT_CACHE_TTL_HOURS || 24));
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+// Configuration
+const CONFIG = {
+  repo: process.env.AWESOME_COPILOT_REPO || "github/awesome-copilot",
+  branch: process.env.AWESOME_COPILOT_BRANCH || "main",
+  maxItems: Math.max(1, Number(process.env.AWESOME_COPILOT_MAX_ITEMS || 15)),
+  cacheTtlHours: Math.max(1, Number(process.env.AWESOME_COPILOT_CACHE_TTL_HOURS || 24)),
+  githubToken: process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "",
+};
+
+// Dynamic package version reading
+function getPackageVersion(): string {
+  try {
+    const packageJson = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+    return packageJson.version || "0.1.0";
+  } catch {
+    return "0.1.0";
+  }
+}
 
 function ghHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     "User-Agent": "mcp-awesome-copilot-server",
     Accept: "application/vnd.github.v3+json",
   };
-  if (GITHUB_TOKEN) headers["Authorization"] = `Bearer ${GITHUB_TOKEN}`;
+  if (CONFIG.githubToken) headers["Authorization"] = `Bearer ${CONFIG.githubToken}`;
   return headers;
 }
 
-// Minimal fetch wrapper with rate-limit friendliness
-async function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+async function delay(ms: number): Promise<void> { 
+  return new Promise(resolve => setTimeout(resolve, ms)); 
+}
 
 async function checkRateLimit(): Promise<void> {
   try {
@@ -59,12 +76,12 @@ type GitTreeEntry = { path: string; type: "blob" | "tree"; sha: string };
 
 async function fetchFullTree(): Promise<GitTreeEntry[]> {
   await checkRateLimit();
-  const branchUrl = `https://api.github.com/repos/${CONTENT_REPO}/branches/${encodeURIComponent(CONTENT_BRANCH)}`;
+  const branchUrl = `https://api.github.com/repos/${CONFIG.repo}/branches/${encodeURIComponent(CONFIG.branch)}`;
   const branchResp = await fetch(branchUrl, { headers: ghHeaders() });
   if (!branchResp.ok) throw new Error(`Failed to read branch info: ${branchResp.status}`);
   const branchInfo = await branchResp.json();
   const treeSha: string = branchInfo?.commit?.commit?.tree?.sha;
-  const treeUrl = `https://api.github.com/repos/${CONTENT_REPO}/git/trees/${treeSha}?recursive=1`;
+  const treeUrl = `https://api.github.com/repos/${CONFIG.repo}/git/trees/${treeSha}?recursive=1`;
   const treeResp = await fetch(treeUrl, { headers: ghHeaders() });
   if (!treeResp.ok) throw new Error(`Failed to read repo tree: ${treeResp.status}`);
   const tree = await treeResp.json();
@@ -102,7 +119,7 @@ function generateId(filename: string, type: ItemType): string {
 }
 
 function buildRawUrl(path: string): string {
-  return `https://raw.githubusercontent.com/${CONTENT_REPO}/${CONTENT_BRANCH}/${path}`;
+  return `https://raw.githubusercontent.com/${CONFIG.repo}/${CONFIG.branch}/${path}`;
 }
 
 // Simple in-memory cache
@@ -112,10 +129,42 @@ let cachedAt: number | null = null;
 // Extension cache service
 const extensionCache = new ExtensionCacheService();
 
+// MCP Server Interface Implementation
+const mcpServerInterface: MCPServerInterface = {
+  search: async (query: string) => {
+    const base = await buildIndex(false);
+    let results = keywordSearch(base, query);
+    if (results.length === 0) {
+      results = keywordSearch(await expandIndexByKeywords(query), query);
+    }
+    return results;
+  },
+  preview: async (path: string) => {
+    const items = await buildIndex(false);
+    const item = items.find(i => i.path === path);
+    if (!item) throw new Error("Item not found in index");
+    const content = await fetchFileContentRaw(item.rawUrl);
+    return { title: item.title, content, rawUrl: item.rawUrl };
+  }
+};
+
+// Mock Web Search Interface (to be replaced with actual web search tool)
+const webSearchInterface: WebSearchInterface = {
+  search: async (query: string, numResults = 5) => {
+    // This would integrate with actual web search tool
+    // For now, return empty results to focus on MCP functionality
+    return [];
+  }
+};
+
+// Intent Router and Search Router
+const intentRouter = new IntentRouter();
+const searchRouter = new SearchRouter(mcpServerInterface, webSearchInterface);
+
 function isCacheValid(): boolean {
   if (!cachedAt) return false;
   const diffHours = (Date.now() - cachedAt) / (1000 * 60 * 60);
-  return diffHours < CACHE_TTL_HOURS;
+  return diffHours < CONFIG.cacheTtlHours;
 }
 
 async function buildIndex(forceRefresh = false): Promise<CatalogItem[]> {
@@ -123,7 +172,7 @@ async function buildIndex(forceRefresh = false): Promise<CatalogItem[]> {
 
   // Try extension cache first
   if (!forceRefresh) {
-    const extensionCachedItems = await extensionCache.getCachedCatalog(CACHE_TTL_HOURS);
+    const extensionCachedItems = await extensionCache.getCachedCatalog(CONFIG.cacheTtlHours);
     if (extensionCachedItems) {
       console.log('Using extension cache for index');
       cachedItems = extensionCachedItems;
@@ -147,7 +196,7 @@ async function buildIndex(forceRefresh = false): Promise<CatalogItem[]> {
     }
   }
 
-  const limited = candidates.slice(0, Math.max(1, MAX_ITEMS));
+  const limited = candidates.slice(0, Math.max(1, CONFIG.maxItems));
   const items: CatalogItem[] = limited.map(({ path, type }) => {
     const filename = path.split("/").pop() || path;
     return {
@@ -180,7 +229,7 @@ async function expandIndexByKeywords(query: string): Promise<CatalogItem[]> {
   
   // Try extension cache if we don't have local cache
   if (existing.length === 0) {
-    const extensionCachedItems = await extensionCache.getCachedCatalog(CACHE_TTL_HOURS);
+    const extensionCachedItems = await extensionCache.getCachedCatalog(CONFIG.cacheTtlHours);
     if (extensionCachedItems) {
       existing = extensionCachedItems;
       cachedItems = extensionCachedItems;
@@ -203,8 +252,7 @@ async function expandIndexByKeywords(query: string): Promise<CatalogItem[]> {
     const haystack = [type, ...entry.path.toLowerCase().split(/[\\/]/)].join(" ");
     if (keywords.every(k => haystack.includes(k))) candidates.push({ path: entry.path, type });
   }
-  const limited = candidates.slice(0, Math.max(1, Math.min(MAX_ITEMS, 50)));
-  const repo = CONTENT_REPO, branch = CONTENT_BRANCH;
+  const limited = candidates.slice(0, Math.max(1, Math.min(CONFIG.maxItems, 50)));
   const newItems: CatalogItem[] = limited.map(({ path, type }) => {
     const filename = path.split("/").pop() || path;
     return {
@@ -212,7 +260,7 @@ async function expandIndexByKeywords(query: string): Promise<CatalogItem[]> {
       type,
       title: extractTitle(filename, type),
       path,
-      rawUrl: `https://raw.githubusercontent.com/${repo}/${branch}/${path}`,
+      rawUrl: buildRawUrl(path),
       lastModified: "",
       description: "",
       sha: "",
@@ -226,9 +274,9 @@ async function expandIndexByKeywords(query: string): Promise<CatalogItem[]> {
   return merged;
 }
 
-// MCP server setup using the TypeScript SDK recommended APIs
+// MCP server setup
 const transport = new StdioServerTransport();
-const packageVersion = "0.1.0"; // keep in sync with package.json
+const packageVersion = getPackageVersion();
 const mcp = new McpServer({ name: "mcp-awesome-copilot-server", version: packageVersion });
 
 // Optional: Titles improve UI display in clients
@@ -244,7 +292,7 @@ mcp.registerTool(
     const resp: HandshakeResponse = {
       serverVersion: packageVersion,
       protocolVersions: ["1.0"],
-      capabilities: ["listItems", "search", "install", "rateLimit", "setRepo"],
+      capabilities: ["listItems", "search", "install", "rateLimit", "setRepo", "intelligentSearch", "telemetry"],
     };
     return { content: [{ type: "text", text: JSON.stringify(resp) }] };
   }
@@ -343,12 +391,12 @@ mcp.registerTool(
     },
   },
   async ({ repo, branch, maxItems, cacheTtlHours }) => {
-    CONTENT_REPO = (repo as string) || CONTENT_REPO;
-    if (branch) CONTENT_BRANCH = String(branch);
-    if (typeof maxItems === "number" && maxItems >= 1) MAX_ITEMS = Math.max(1, Math.floor(maxItems));
-    if (typeof cacheTtlHours === "number" && cacheTtlHours >= 1) CACHE_TTL_HOURS = Math.max(1, Math.floor(cacheTtlHours));
+    CONFIG.repo = (repo as string) || CONFIG.repo;
+    if (branch) CONFIG.branch = String(branch);
+    if (typeof maxItems === "number" && maxItems >= 1) CONFIG.maxItems = Math.max(1, Math.floor(maxItems));
+    if (typeof cacheTtlHours === "number" && cacheTtlHours >= 1) CONFIG.cacheTtlHours = Math.max(1, Math.floor(cacheTtlHours));
     cachedItems = null; cachedAt = null;
-    return { content: [{ type: "text", text: JSON.stringify({ repo: CONTENT_REPO, branch: CONTENT_BRANCH, maxItems: MAX_ITEMS, cacheTtlHours: CACHE_TTL_HOURS }) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ repo: CONFIG.repo, branch: CONFIG.branch, maxItems: CONFIG.maxItems, cacheTtlHours: CONFIG.cacheTtlHours }) }] };
   }
 );
 
@@ -364,12 +412,170 @@ mcp.registerTool(
       content: [{ 
         type: "text", 
         text: JSON.stringify({ 
-          repo: CONTENT_REPO, 
-          branch: CONTENT_BRANCH, 
-          maxItems: MAX_ITEMS, 
-          cacheTtlHours: CACHE_TTL_HOURS, 
-          tokenConfigured: Boolean(GITHUB_TOKEN),
-          extensionCache: extensionCacheInfo
+          repo: CONFIG.repo, 
+          branch: CONFIG.branch, 
+          maxItems: CONFIG.maxItems, 
+          cacheTtlHours: CONFIG.cacheTtlHours, 
+          tokenConfigured: Boolean(CONFIG.githubToken),
+          extensionCache: extensionCacheInfo,
+          searchRouterPreferences: searchRouter.getPreferences()
+        }) 
+      }] 
+    };
+  }
+);
+
+// Intelligent search tools
+mcp.registerTool(
+  "analyze_intent",
+  {
+    title: "Analyze Query Intent",
+    description: "Analyze a user query to determine the best search strategy (MCP vs web search)",
+    inputSchema: { 
+      query: z.string(),
+      preferences: z.object({
+        mcpFirst: z.boolean().optional(),
+        mcpOnlyForBestPractices: z.boolean().optional(),
+        fallbackToWeb: z.boolean().optional(),
+        minConfidenceThreshold: z.number().optional()
+      }).optional()
+    },
+  },
+  async ({ query, preferences }) => {
+    const intent = intentRouter.analyzeIntent(String(query), preferences || {});
+    const strategy = intentRouter.createSearchStrategy(String(query), preferences || {});
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify({ intent, strategy }) 
+      }] 
+    };
+  }
+);
+
+mcp.registerTool(
+  "intelligent_search",
+  {
+    title: "Intelligent Search",
+    description: "Perform intelligent search with MCP-first strategy based on query intent analysis",
+    inputSchema: { 
+      query: z.string(),
+      preferences: z.object({
+        mcpFirst: z.boolean().optional(),
+        mcpOnlyForBestPractices: z.boolean().optional(),
+        fallbackToWeb: z.boolean().optional(),
+        minConfidenceThreshold: z.number().optional()
+      }).optional()
+    },
+  },
+  async ({ query, preferences }) => {
+    if (preferences) {
+      searchRouter.updatePreferences(preferences);
+    }
+    
+    const result = await searchRouter.search(String(query));
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify(result) 
+      }] 
+    };
+  }
+);
+
+mcp.registerTool(
+  "update_search_preferences",
+  {
+    title: "Update Search Preferences",
+    description: "Update user preferences for intelligent search routing",
+    inputSchema: { 
+      preferences: z.object({
+        mcpFirst: z.boolean().optional(),
+        mcpOnlyForBestPractices: z.boolean().optional(),
+        fallbackToWeb: z.boolean().optional(),
+        minConfidenceThreshold: z.number().optional()
+      })
+    },
+  },
+  async ({ preferences }) => {
+    searchRouter.updatePreferences(preferences);
+    const updated = searchRouter.getPreferences();
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify({ 
+          message: "Search preferences updated successfully",
+          preferences: updated
+        }) 
+      }] 
+    };
+  }
+);
+
+// Telemetry tools
+mcp.registerTool(
+  "get_telemetry_stats",
+  {
+    title: "Get Telemetry Statistics",
+    description: "Get comprehensive telemetry statistics about MCP server usage and resource discovery patterns",
+  },
+  async () => {
+    const stats = telemetryService.getStats();
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify(stats, null, 2) 
+      }] 
+    };
+  }
+);
+
+mcp.registerTool(
+  "get_recent_telemetry_events",
+  {
+    title: "Get Recent Telemetry Events",
+    description: "Get recent telemetry events to understand search patterns and outcomes",
+    inputSchema: { 
+      limit: z.number().int().min(1).max(100).optional().default(20)
+    },
+  },
+  async ({ limit }) => {
+    const events = telemetryService.getRecentEvents(limit || 20);
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify(events, null, 2) 
+      }] 
+    };
+  }
+);
+
+mcp.registerTool(
+  "configure_telemetry",
+  {
+    title: "Configure Telemetry",
+    description: "Enable/disable telemetry collection or clear telemetry data",
+    inputSchema: { 
+      enabled: z.boolean().optional(),
+      clearData: z.boolean().optional()
+    },
+  },
+  async ({ enabled, clearData }) => {
+    if (typeof enabled === 'boolean') {
+      telemetryService.setEnabled(enabled);
+    }
+    
+    if (clearData === true) {
+      telemetryService.clearData();
+    }
+    
+    return { 
+      content: [{ 
+        type: "text", 
+        text: JSON.stringify({ 
+          message: "Telemetry configuration updated",
+          enabled: telemetryService.isEnabled(),
+          dataCleared: clearData === true
         }) 
       }] 
     };
@@ -484,7 +690,7 @@ async function maybePrintHandshakeAndExit(): Promise<boolean> {
     const resp: HandshakeResponse = {
       serverVersion: packageVersion,
       protocolVersions: ["1.0"],
-      capabilities: ["listItems", "search", "install", "rateLimit", "setRepo"],
+      capabilities: ["listItems", "search", "install", "rateLimit", "setRepo", "intelligentSearch", "telemetry"],
     };
     console.log(JSON.stringify(resp));
     return true;
